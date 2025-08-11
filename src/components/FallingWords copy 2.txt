@@ -1,5 +1,5 @@
-// src/components/FallingWords.tsx
-import React, { useCallback, useEffect, useRef, useState } from "react";
+// FallingWords.tsx
+import React, { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -21,17 +21,19 @@ const difficulties = {
     hard: { spawnMs: 900, baseSpeed: 170 },
 } as const;
 
-const wordData: Record<string, string[]> = {
+const wordData = {
     all: [],
     animals: ["cat", "dog", "lion", "tiger", "elephant", "bear", "wolf", "eagle", "shark", "whale"],
     food: ["pizza", "burger", "pasta", "rice", "bread", "cake", "sushi", "noodles", "steak", "salad"],
     college: ["campus", "lecture", "exam", "thesis", "student", "library", "assignment", "professor"],
     computer: ["keyboard", "mouse", "monitor", "laptop", "code", "python", "javascript", "server"],
+    // ... (rest omitted for brevity if you already have wordData)
 };
 
-// Merge all into "all" (safe)
-wordData.all = (Object.values(wordData).flat() as string[]).filter(Boolean);
+// Merge all into "all" if not already (safe guard)
+wordData.all = Object.values(wordData).flat().filter(Boolean) as string[];
 
+// helper random
 function rand(min: number, max: number) {
     return Math.random() * (max - min) + min;
 }
@@ -58,7 +60,7 @@ export default function FallingWords() {
     const [lives, setLives] = useState(3);
     const [playing, setPlaying] = useState(false);
     const [paused, setPaused] = useState(false);
-    const [highScore, setHighScore] = useState<number>(0);
+    const [highScore, setHighScore] = useState<number>(Number(localStorage.getItem("fw_high") || 0));
     const [showGameOver, setShowGameOver] = useState(false);
     const [typedCorrect, setTypedCorrect] = useState<string[]>([]);
     const [typedMissed, setTypedMissed] = useState<string[]>([]);
@@ -71,64 +73,50 @@ export default function FallingWords() {
     const inputRef = useRef<HTMLInputElement | null>(null);
     const gameStartTimeRef = useRef<number>(0);
 
-    // load high score safely (SSR-safe)
-    useEffect(() => {
-        if (typeof window !== "undefined") {
-            const saved = Number(localStorage.getItem("fw_high") || 0);
-            setHighScore(saved);
-        }
-    }, []);
+    const focusInput = () => setTimeout(() => inputRef.current?.focus(), 50);
 
-    // helpers memoized so they can be safely used in effects
-    const focusInput = useCallback(() => {
-        // small delay helps when fullscreen toggles
-        setTimeout(() => inputRef.current?.focus(), 50);
-    }, []);
-
-    const clearTimers = useCallback(() => {
-        if (rafRef.current !== null) {
-            cancelAnimationFrame(rafRef.current);
-        }
-        if (spawnTimerRef.current !== null) {
-            clearInterval(spawnTimerRef.current);
-        }
+    const clearTimers = () => {
+        if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        if (spawnTimerRef.current) clearInterval(spawnTimerRef.current);
         rafRef.current = null;
         spawnTimerRef.current = null;
-    }, []);
+    };
 
-    const flushActiveToState = useCallback(() => {
-        setActive([...activeRef.current]);
-    }, []);
+    const flushActiveToState = () => setActive([...activeRef.current]);
 
     // persist high score
     useEffect(() => {
-        if (typeof window !== "undefined") {
-            localStorage.setItem("fw_high", String(highScore));
-        }
+        localStorage.setItem("fw_high", String(highScore));
     }, [highScore]);
 
     // fullscreen listener
     useEffect(() => {
         const onFull = () => {
             setIsFullscreen(Boolean(document.fullscreenElement));
-            if (document.fullscreenElement) {
-                focusInput();
-            }
+            if (document.fullscreenElement) focusInput();
         };
         document.addEventListener("fullscreenchange", onFull);
         return () => document.removeEventListener("fullscreenchange", onFull);
-    }, [focusInput]);
+    }, []);
 
-    const getElapsed = useCallback(() => {
+    // --- Difficulty algorithm (level & speed) ---
+    // We'll compute a "level" based on elapsed seconds since start.
+    // level increases gradually (every 15 seconds for example).
+    // speed for a spawned word will be:
+    //   baseSpeed * (1 + level * levelFactor) + random(0, variance)
+    // spawn interval will decrease with elapsed time too (but clamped to min)
+
+    const getElapsed = () => {
         return (performance.now() - gameStartTimeRef.current) / 1000 || 0;
-    }, []);
+    };
 
-    const getLevel = useCallback((elapsedSec: number) => {
-        const lvl = Math.floor(elapsedSec / 15);
-        return Math.min(lvl, 10);
-    }, []);
+    const getLevel = (elapsedSec: number) => {
+        // e.g., increase level every 15 seconds, but cap at some max
+        const lvl = Math.floor(elapsedSec / 15); // every 15s -> +1 level
+        return Math.min(lvl, 10); // cap level to avoid extreme speed
+    };
 
-    // animation loop
+    // Game animation loop (move words)
     useEffect(() => {
         if (!playing || paused) return;
 
@@ -154,8 +142,9 @@ export default function FallingWords() {
                 }
             }
 
+            // remove missed words and reduce lives by count
             if (missedWords.length > 0) {
-                setTypedMissed((p) => [...p, ...missedWords]);
+                setTypedMissed((prev) => [...prev, ...missedWords]);
                 setLives((prevLives) => Math.max(0, prevLives - missedWords.length));
             }
 
@@ -168,23 +157,28 @@ export default function FallingWords() {
         rafRef.current = requestAnimationFrame(loop);
 
         return () => {
-            if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+            if (rafRef.current) cancelAnimationFrame(rafRef.current);
             rafRef.current = null;
         };
-    }, [playing, paused, flushActiveToState]);
+        // only depend on playing & paused
+    }, [playing, paused]);
 
-    // spawn loop
+    // Spawn loop
     useEffect(() => {
         if (!playing || paused) return;
 
+        // spawn once immediately then set interval (we'll also re-schedule interval inside spawn to adapt spawn rate)
         const spawn = () => {
+            // compute elapsed & level
             const elapsed = getElapsed();
             const level = getLevel(elapsed);
 
+            // spawn ms dynamic: base - elapsed * factor, clamp to min
             const spawnMsBase = difficulties[difficulty].spawnMs;
             const minSpawnMs = 350;
             const spawnMsDynamic = Math.max(minSpawnMs, Math.round(spawnMsBase - elapsed * 8 - level * 20));
 
+            // choose word from theme list
             const list = wordData[theme] ?? wordData.all;
             if (list.length === 0) return;
 
@@ -192,36 +186,111 @@ export default function FallingWords() {
             const id = String(Math.random()).slice(2);
             const x = Math.round(rand(5, 95));
 
+            // speed generation:
+            // base from difficulty, then multiply by level factor and add random variance
             const base = difficulties[difficulty].baseSpeed;
+            // levelFactor increases speed modestly per level (e.g., 8% per level)
             const levelFactor = 0.08 * level;
-            const variance = rand(0, 40);
-            const multiplier = 1 + levelFactor + rand(-0.05, 0.15);
+            const variance = rand(0, 40); // random offset
+            // random multiplier to avoid identical speeds
+            const multiplier = 1 + levelFactor + rand(-0.05, 0.15); // small randomness
             const speed = Math.max(20, Math.round((base + variance) * multiplier));
 
             activeRef.current.push({ id, text, x, y: 0, speed });
             flushActiveToState();
 
-            if (spawnTimerRef.current !== null) {
+            // re-schedule spawn interval dynamically
+            if (spawnTimerRef.current) {
                 clearInterval(spawnTimerRef.current);
                 spawnTimerRef.current = window.setInterval(spawn, spawnMsDynamic);
             }
         };
 
-        // immediate spawn + interval
-        spawn();
+        // start spawn with immediate call and set interval
+        spawn(); // immediate first
         const initialSpawnMs = difficulties[difficulty].spawnMs;
         spawnTimerRef.current = window.setInterval(spawn, initialSpawnMs);
 
+        // cleanup
         return () => {
-            if (spawnTimerRef.current !== null) {
+            if (spawnTimerRef.current) {
                 clearInterval(spawnTimerRef.current);
                 spawnTimerRef.current = null;
             }
         };
-    }, [playing, paused, difficulty, theme, flushActiveToState, getElapsed, getLevel]);
+    }, [playing, paused, difficulty, theme]);
 
-    // game control functions (memoized for stable identity)
-    const startGame = useCallback(() => {
+    // Game over monitor
+    useEffect(() => {
+        if (lives <= 0) {
+            clearTimers();
+            setPlaying(false);
+            activeRef.current = [];
+            flushActiveToState();
+            setShowGameOver(true);
+            setHighScore((prevHigh) => (score > prevHigh ? score : prevHigh));
+
+            if (document.fullscreenElement) {
+                document.exitFullscreen().catch(() => {});
+            }
+        }
+    }, [lives, score]);
+
+    // keyboard shortcuts: Ctrl+Alt+S / Ctrl+Alt+P / Ctrl+Alt+F
+    useEffect(() => {
+        const handler = (e: KeyboardEvent) => {
+            // avoid interfering when typing in inputs? we still allow shortcuts for game control
+            if (e.ctrlKey && e.altKey && e.code === "KeyS") {
+                e.preventDefault();
+                toggleStartStop();
+                focusInput();
+            }
+            if (e.ctrlKey && e.altKey && e.code === "KeyP") {
+                e.preventDefault();
+                if (playing) {
+                    setPaused((p) => {
+                        const next = !p;
+                        // focus when resuming
+                        if (!next) focusInput();
+                        return next;
+                    });
+                }
+            }
+            if (e.ctrlKey && e.altKey && e.code === "KeyF") {
+                e.preventDefault();
+                toggleFullscreen();
+            }
+        };
+        window.addEventListener("keydown", handler);
+        return () => window.removeEventListener("keydown", handler);
+    }, [playing]);
+
+    // handle typing input
+    const handleInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (!playing || paused) return;
+        const val = e.target.value;
+        setInput(val);
+        const trimmed = val.trim();
+        if (!trimmed) return;
+
+        // find word by text
+        const found = activeRef.current.find((w) => w.text === trimmed);
+        if (!found) return;
+
+        // award score
+        setTypedCorrect((prev) => [...prev, found.text]);
+        setScore((s) => s + Math.max(10, found.text.length * 10));
+
+        // remove found word safely
+        activeRef.current = activeRef.current.filter((w) => w.id !== found.id);
+        flushActiveToState();
+
+        // clear input
+        setInput("");
+    };
+
+    // start / stop / resume logic
+    const startGame = () => {
         clearTimers();
         activeRef.current = [];
         flushActiveToState();
@@ -236,27 +305,27 @@ export default function FallingWords() {
         setPaused(false);
         setPlaying(true);
         focusInput();
-    }, [clearTimers, flushActiveToState, focusInput]);
+    };
 
-    const stopGame = useCallback(() => {
+    const stopGame = () => {
         clearTimers();
         setPlaying(false);
         setPaused(false);
         activeRef.current = [];
         flushActiveToState();
-    }, [clearTimers, flushActiveToState]);
+    };
 
-    const resumeGame = useCallback(() => {
+    const resumeGame = () => {
         setPaused(false);
         focusInput();
-    }, [focusInput]);
+    };
 
-    const toggleStartStop = useCallback(() => {
+    const toggleStartStop = () => {
         if (!playing) startGame();
         else stopGame();
-    }, [playing, startGame, stopGame]);
+    };
 
-    const toggleFullscreen = useCallback(async () => {
+    const toggleFullscreen = async () => {
         try {
             if (!document.fullscreenElement && playRef.current) {
                 await playRef.current.requestFullscreen();
@@ -267,81 +336,14 @@ export default function FallingWords() {
         } catch {
             // ignore
         }
-    }, [focusInput]);
-
-    // monitor game over
-    useEffect(() => {
-        if (lives <= 0) {
-            clearTimers();
-            setPlaying(false);
-            activeRef.current = [];
-            flushActiveToState();
-            setShowGameOver(true);
-            setHighScore((prevHigh) => (score > prevHigh ? score : prevHigh));
-
-            if (document.fullscreenElement) {
-                // call and ignore failures
-                document.exitFullscreen().catch(() => {});
-            }
-        }
-    }, [lives, score, clearTimers, flushActiveToState]);
-
-    // keyboard shortcuts
-    useEffect(() => {
-        const handler = (e: KeyboardEvent) => {
-            if (e.ctrlKey && e.altKey && e.code === "KeyS") {
-                e.preventDefault();
-                toggleStartStop();
-                focusInput();
-            }
-            if (e.ctrlKey && e.altKey && e.code === "KeyP") {
-                e.preventDefault();
-                if (playing) {
-                    setPaused((p) => {
-                        const next = !p;
-                        if (!next) focusInput();
-                        return next;
-                    });
-                }
-            }
-            if (e.ctrlKey && e.altKey && e.code === "KeyF") {
-                e.preventDefault();
-                toggleFullscreen();
-            }
-        };
-        window.addEventListener("keydown", handler);
-        return () => window.removeEventListener("keydown", handler);
-    }, [playing, toggleStartStop, toggleFullscreen, focusInput]);
-
-    // typing handler
-    const handleInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-        if (!playing || paused) return;
-        const val = e.target.value;
-        setInput(val);
-        const trimmed = val.trim();
-        if (!trimmed) return;
-
-        const found = activeRef.current.find((w) => w.text === trimmed);
-        if (!found) return;
-
-        setTypedCorrect((p) => [...p, found.text]);
-        setScore((s) => s + Math.max(10, found.text.length * 10));
-
-        activeRef.current = activeRef.current.filter((w) => w.id !== found.id);
-        flushActiveToState();
-
-        setInput("");
     };
-
-    // select handlers (avoid `any`)
-    const handleDifficultyChange = (v: string) => setDifficulty(v as "easy" | "medium" | "hard");
-    const handleThemeChange = (v: string) => setTheme(v as keyof typeof wordData);
 
     return (
         <>
             <Card className="text-neutral-100 bg-transparent">
                 <CardHeader>
                     <CardTitle className="flex gap-x-4 items-center">
+                        {/* Logo SVG */}
                         <svg fill="none" height="48" viewBox="0 0 44 48" width="44" xmlns="http://www.w3.org/2000/svg">
                             <g fill="#fff">
                                 <path d="m16 8 5.0912 10.9088 10.9088 5.0912-10.9088 5.0912-5.0912 10.9088-5.0912-10.9088-10.9088-5.0912 10.9088-5.0912z" />
@@ -353,13 +355,13 @@ export default function FallingWords() {
                 </CardHeader>
 
                 <CardContent className="space-y-4">
+                    {/* Stats + Controls */}
                     <div className="flex flex-wrap gap-2 justify-between text-sm sm:text-base">
                         <div className="space-x-4 flex items-center flex-wrap">
                             <span>Score: {score}</span>
                             <span>Lives: {lives}</span>
                             <span>High Score: {highScore}</span>
                         </div>
-
                         <div className="flex flex-wrap gap-2 items-center">
                             <Button
                                 variant="outline"
@@ -377,8 +379,7 @@ export default function FallingWords() {
                             <Button
                                 variant="outline"
                                 onClick={() => {
-                                    if (paused) resumeGame();
-                                    else setPaused(true);
+                                    paused ? resumeGame() : setPaused(true);
                                     focusInput();
                                 }}
                                 size="sm"
@@ -397,6 +398,7 @@ export default function FallingWords() {
                         </div>
                     </div>
 
+                    {/* Play area */}
                     <div ref={playRef} className="relative border border-neutral-800 rounded-lg h-64 sm:h-72 overflow-hidden bg-neutral-950/20" style={isFullscreen ? { height: "100vh" } : undefined}>
                         {active.map((w) => (
                             <div key={w.id} style={{ left: `${w.x}%`, top: `${w.y}px` }} className="absolute -translate-x-1/2 px-2 sm:px-3 py-1 bg-violet-600 rounded text-xs sm:text-sm font-medium shadow">
@@ -404,18 +406,19 @@ export default function FallingWords() {
                             </div>
                         ))}
 
-                        {isFullscreen ? (
+                        {isFullscreen && (
                             <div className="absolute bottom-2 left-1/2 -translate-x-1/2 w-11/12">
-                                <Input ref={inputRef} value={input} onChange={handleInput} placeholder={playing ? (paused ? "Paused" : "Type here...") : "Press Start to play"} className="bg-neutral-800 border-neutral-700 text-neutral-100 w-full" disabled={!playing || paused} />
+                                <Input ref={inputRef as any} value={input} onChange={handleInput} placeholder={playing ? (paused ? "Paused" : "Type here...") : "Press Start to play"} className="bg-neutral-800 border-neutral-700 text-neutral-100 w-full" disabled={!playing || paused} />
                             </div>
-                        ) : null}
+                        )}
                     </div>
 
+                    {/* Controls row (when not fullscreen) */}
                     {!isFullscreen && (
                         <div className="flex flex-col sm:flex-row gap-2">
-                            <Input ref={inputRef} value={input} onChange={handleInput} placeholder={playing ? (paused ? "Paused" : "Type here...") : "Press Start to play"} className="bg-neutral-800 border-neutral-700 text-neutral-100 flex-1" disabled={!playing || paused} />
+                            <Input ref={inputRef as any} value={input} onChange={handleInput} placeholder={playing ? (paused ? "Paused" : "Type here...") : "Press Start to play"} className="bg-neutral-800 border-neutral-700 text-neutral-100 flex-1" disabled={!playing || paused} />
 
-                            <Select value={difficulty} onValueChange={handleDifficultyChange}>
+                            <Select value={difficulty} onValueChange={(v: any) => setDifficulty(v)}>
                                 <SelectTrigger className="w-full sm:w-32 bg-neutral-800 border-neutral-700 text-neutral-100">
                                     <SelectValue placeholder="Difficulty" />
                                 </SelectTrigger>
@@ -426,7 +429,7 @@ export default function FallingWords() {
                                 </SelectContent>
                             </Select>
 
-                            <Select value={theme} onValueChange={handleThemeChange}>
+                            <Select value={theme} onValueChange={(v: any) => setTheme(v)}>
                                 <SelectTrigger className="w-full sm:w-40 bg-neutral-800 border-neutral-700 text-neutral-100">
                                     <SelectValue placeholder="Theme" />
                                 </SelectTrigger>
@@ -443,6 +446,7 @@ export default function FallingWords() {
                 </CardContent>
             </Card>
 
+            {/* Game Over Dialog */}
             <Dialog open={showGameOver} onOpenChange={setShowGameOver}>
                 <DialogContent className="bg-neutral-900 text-neutral-100 border-neutral-700 w-[90%] sm:w-full max-w-lg p-4 sm:p-6 rounded-lg">
                     <DialogHeader>
